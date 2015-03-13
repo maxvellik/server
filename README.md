@@ -1,0 +1,2 @@
+# server
+simple linux server

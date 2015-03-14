@@ -14,6 +14,9 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <pwd.h>
+#include <fcntl.h>
+
+#define min(a, b) ((a) < (b) ? (a) : (b))
 
 #define MAX_STR_LEN 255
 #define MAX_RECORD_STR_LEN 50
@@ -25,7 +28,7 @@
 #define INPUT_USR 4
 #define OUTPUT_USR 8
 typedef struct List List;
-
+typedef struct pList pList;
 struct List{
     char user[MAX_RECORD_STR_LEN];
     char password[MAX_RECORD_STR_LEN];
@@ -37,6 +40,10 @@ struct List{
     List * next;
 } * table = NULL;
 
+struct pList{
+    int pid;
+    pList *next;
+} * pidList;
 int servFd;
 int clientFd = 0;
 
@@ -304,7 +311,7 @@ int check_leters (char *str, int len, char *pat, int patlen)
     {
     for (j = 0; j < patlen; ++j)
     {
-        if (str[i] == str[j])
+        if (str[i] == pat[j])
         return i;
     }
     }
@@ -314,7 +321,7 @@ int check_leters (char *str, int len, char *pat, int patlen)
  * read from sd to buf until symbols from end found.
  * bufsize is the length of buf.
  */
-int read_until (int sd, char *buf, int bufsize, char *end)
+int read_until (int sd, char *buf, int bufsize, char *end, char *brk_sym)
 {
     int chk_end = 1;
     int buflen = 0;
@@ -334,9 +341,10 @@ int read_until (int sd, char *buf, int bufsize, char *end)
       {/*hole buf has no end chars.*/
          if (rc == bufsize)
          {
-             char tmp[bufsize];
-             recv(sd, tmp, bufsize, 0);
+             char tmp[rc];
+             recv(sd, tmp, rc, 0);
              chk_end = 0;
+             buflen = rc;
          }
       }
       else if (buflen)
@@ -344,18 +352,29 @@ int read_until (int sd, char *buf, int bufsize, char *end)
           char tmp[buflen + 1];
           recv(sd, tmp, buflen + 1, 0);
           chk_end = 0;
-          buf[buflen] = '\0';
-          bufsize = buflen;
       }
       else
       {/* the first symbol is end sybmol */
           char c;
           recv(sd, &c, 1, 0);
           chk_end = 0;
-          buf[0] = '\0';
-          bufsize = 0;
       }
     } while(chk_end);
+    if (buflen < bufsize)
+    {
+        if (brk_sym)
+        {
+            *brk_sym = buf[buflen];
+        }
+        buf[buflen] = 0;
+    }
+    else
+    {
+        if (brk_sym)
+        {
+            *brk_sym = 0;
+        }
+    }
     return bufsize;
 }
 
@@ -365,14 +384,12 @@ int read_malloc_until(int sd, char **str, int maxsize, char *end)
     int len = 0;
     int rc;
     int csize = BUF_SIZE;
-    *str = malloc(BUF_SIZE * sizeof(char));
+    *str = (char *) malloc(csize + 1);
     while(1)
     {
-        rc = read_until(sd, buf, BUF_SIZE, end);
+        rc = read_until(sd, buf, BUF_SIZE, end, NULL);
         if (rc + len > maxsize)
-        {/** tried to recieve more then possible */
-            free(*str);
-            str = NULL;
+        {/** tried to recieve more then possible */ 
             return -1;
         }
         if (rc == BUF_SIZE)
@@ -380,9 +397,9 @@ int read_malloc_until(int sd, char **str, int maxsize, char *end)
             if (rc + len > csize)
             {/** need to realloc **/
                 csize = min(maxsize, csize << 1);
-                *str = realloc(*str, csize);
+                *str = (char *) realloc(*str, csize + 1);
             }
-            strncpy(*str + len, buf, BUF_SIZE);
+            memcpy(*str + len, buf, rc);
             len += rc;
         }
         else
@@ -390,14 +407,14 @@ int read_malloc_until(int sd, char **str, int maxsize, char *end)
             if (rc + len > csize)
             {/** need to realloc **/
                 csize = rc + len;
-                *str = realloc(*str, csize);
+                *str = (char *) realloc(*str, csize);
             }
-            strncpy(*str + len, buf, rc);
+            memcpy(*str + len, buf, rc);
             len += rc;
-
             break;
         }
     }
+    (*str)[len] = 0;
 }
 int skip_spaces()
 {
@@ -406,10 +423,14 @@ int skip_spaces()
     int i, rc;
     do
     {
-         rc = recv(clientFd, buf, MAX_STR_LEN, MSG_PEEK);
+        rc = recv(clientFd, buf, MAX_STR_LEN, MSG_PEEK);
+        if (rc == -1 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            return 0;
+        }
         if (rc == -1)
         {
-            fprintf(stream, "error reading socket:\n%s", strerror(errno));
+            fprintf(stream, "error reading socket:\n%s\n", strerror(errno));
             return -1;
         }
         for (i = 0; i < rc; ++i)
@@ -436,7 +457,7 @@ void show_stat(int fd)
 
            switch (sb.st_mode & S_IFMT) {
            case S_IFBLK:  printf("block device\n");            break;
-           irintf("File type:                ");
+           printf("File type:                ");
 
            switch (sb.st_mode & S_IFMT) {
            case S_IFBLK:  printf("block device\n");            break;
@@ -535,7 +556,7 @@ void runCommand(char *user, char *passwd, char *cmd, char *tail,
                     struct passwd *pwd;
                     errno = 0;
                     pwd = getpwnam (currentItem -> sysUser);
-                    if (pwd == NULL && errno == 0)
+                   if (pwd == NULL && errno == 0)
                     {
                         fprintf (stream, "%s error no such system user found: %s\n",
                                  gettime(), currentItem -> sysUser);
@@ -547,7 +568,8 @@ void runCommand(char *user, char *passwd, char *cmd, char *tail,
                         return;
                     }
                     int uid = pwd -> pw_uid;
-                    char sysCmd[2 * MAX_RECORD_STR_LEN + IP_STR_LEN + strlen(tail) + 10];//10 is magic amount off additional spaces and last symbol
+                    char sysCmd[2 * MAX_RECORD_STR_LEN + IP_STR_LEN + strlen(tail) + 10];
+                    //10 is magic amount off additional spaces and last symbol
                     sprintf(sysCmd, "%s", currentItem -> sysCommand);
                     char * flagPos = strstr(sysCmd, "%i");
                     if (flagPos)
@@ -584,9 +606,11 @@ void runCommand(char *user, char *passwd, char *cmd, char *tail,
                             //char buf[MAX_STR_LEN];
                             dup2(clientFd, 0);
                             close(clientFd);
-                            execlp("cat", "cat", NULL);
-                            fprintf(stream, "%s error on exec:\n%s", gettime(), strerror(errno));
-                            exit(-1);
+                            exit (full_read(0, 1));
+                            
+                            //execlp("cat", "cat", NULL);
+                            //fprintf(stream, "%s error on exec:\n%s", gettime(), strerror(errno));
+                            //exit(-1);
                         }
                     }
 
@@ -631,7 +655,68 @@ void runCommand(char *user, char *passwd, char *cmd, char *tail,
         case 1: case 2: sprintf(str, "Unknown user or password\n"); break;
     }
 }
-
+void check_children()
+{
+    int pid, status;
+    pid = waitpid(0, &status, WNOHANG); 
+}
+int full_read(int sd, int out_d)
+{
+    char buf[BUF_SIZE];
+    char end_symb[] = {10, 13, 0};
+    int rc;
+    int end = 0;
+    char last = 0;
+    do
+    {
+        rc = read(sd, buf, BUF_SIZE);
+        if (rc < 0)
+        {
+            fprintf(stream, "%s error reading socket:\n%s", 
+                    gettime(), strerror(errno));
+            return -1;
+        }
+        if (rc == 0)
+        {
+            return 0;
+        }
+        int j = 0;
+        if (end && strchr(end_symb, buf[0]))
+        {
+            while(j < rc && end)
+            {
+                if (strchr(end_symb, buf[j]))
+                {
+                    ++j;
+                    end += buf[j] == last;
+                }
+                else
+                {
+                    end = 0;
+                }
+            }
+            if (end > 2)
+            {
+                break;
+            }
+        }
+        last = *strchrnul(end_symb, buf[rc - 1]);
+        for (j = rc - 1; j >= 0; --j)
+        {
+            if (strchr(end_symb, buf[j]))
+            {
+                end += buf[j] == last;
+            }
+            else
+            {
+                break;
+            }
+        }
+        write(out_d, buf, rc);
+    } while (end < 3);
+    //shutdown(sd, SHUT_RD);
+    return 0;
+}
 int main(int argc, char * argv[])
 {
     struct sockaddr_in servAddr;
@@ -649,7 +734,8 @@ int main(int argc, char * argv[])
     servAddr.sin_family = AF_INET;
     servAddr.sin_port = htons(port);
     servAddr.sin_addr.s_addr = ip;
-
+    int opt = 1;
+    setsockopt(servFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
     if (bind(servFd, (const struct sockaddr *)&servAddr, sizeof(servAddr)) < 0)
     {
         fprintf(stream, "%s Error: bind error\n", gettime()); exit(-1);
@@ -662,6 +748,7 @@ int main(int argc, char * argv[])
     signal(SIGINT, exitEvent);
     signal(SIGTERM, exitEvent);
     signal(SIGALRM, closeConnection);
+    signal(SIGCHLD, check_children);
 
     if (isChange(filename)) readFile(filename);
 
@@ -689,20 +776,29 @@ int main(int argc, char * argv[])
         //fprintf(stream, "%s Connect %s\n", gettime(), strIp);
         fflush(stream);
 
-        alarm(timeout);
+        //alarm(timeout);
+        if (fork() == 0) //child process connection
+        {
+            alarm(timeout);
         bufLength = 0;
-
         breakWhile = 0;
         char user[MAX_RECORD_STR_LEN];
         char pswd[MAX_RECORD_STR_LEN];
         char cmd[MAX_RECORD_STR_LEN];
-        char *tail;
+        char *tail = "";
+        char last;
+        int chk_tail = 1;
         do {
             //int recLen = recv(clientFd, buf + bufLength, BUF_SIZE - bufLength, 0);
             //if (recLen != BUF_SIZE - bufLength) breakWhile = 1;
-            int recLen = read_until (clientFd, buf, MAX_RECORD_STR_LEN, " ");
-            if (recLen < MAX_RECORD_STR_LEN)
+            int recLen = read_until (clientFd, buf, MAX_RECORD_STR_LEN, " ", &last);
+            /*reading user*/
+            if (last)
             {
+                if (buf[recLen] == 10 || buf[recLen] == 13)
+                {
+                    chk_tail = 0;
+                }
                 buf[recLen] = '\0';
             }
             else
@@ -712,11 +808,21 @@ int main(int argc, char * argv[])
                 fprintf(stream, "%s error: %s.", gettime(), str);
                 break;
             }
+            if (echo) 
+            {
+                fprintf(stream, "user %s\n", buf);
+            }
+
             strcpy(user, buf);
             skip_spaces();
-            recLen = read_until(clientFd, buf, MAX_RECORD_STR_LEN, " ");
-            if (recLen < MAX_RECORD_STR_LEN)
+            recLen = read_until(clientFd, buf, MAX_RECORD_STR_LEN, " ", &last);
+            /*reading password*/
+            if (last)
             {
+                if (buf[recLen] == 10 || buf[recLen] == 13)
+                {
+                    chk_tail = 0;
+                }
                 buf[recLen] = '\0';
             }
             else
@@ -726,11 +832,21 @@ int main(int argc, char * argv[])
                 fprintf(stream, "%s error: %s.", gettime(), str);
                 break;
             }
+            if (echo) 
+            {
+                fprintf(stream, "password %s\n", buf);
+            }
+
+
             strcpy(pswd, buf);
             skip_spaces();
-            recLen = read_until(clientFd, buf, MAX_RECORD_STR_LEN, " ");
-            if (recLen < MAX_RECORD_STR_LEN)
+            recLen = read_until(clientFd, buf, MAX_RECORD_STR_LEN, " ", &last);
+            if (last)
             {
+                if (buf[recLen] == 10 || buf[recLen] == 13)
+                {
+                    chk_tail = 0;
+                }
                 buf[recLen] = '\0';
             }
             else
@@ -740,8 +856,23 @@ int main(int argc, char * argv[])
                 fprintf(stream, "%s error: %s.", gettime(), str);
                 break;
             }
+            if (echo) 
+            {
+                fprintf(stream, "command %s\n", buf);
+            }
+
+
             strcpy(cmd, buf);
-            read_malloc_until(clientFd, &tail, ARG_MAX, "\n");
+            if(chk_tail)
+            {
+                read_malloc_until(clientFd, &tail, ARG_MAX, "\n");
+            }
+            if (echo) 
+            {
+                fprintf(stream, "tail %s\n", tail);
+            }
+
+
             if (clientFd)
                     {
                         fprintf(stream, "%s Get Command '%s %s %s %s'\n", gettime(), user, pswd, cmd, tail);
@@ -798,6 +929,7 @@ int main(int argc, char * argv[])
             shutdown(clientFd, SHUT_RDWR);
             close(clientFd);
             clientFd = 0;
+        }
         }
     }
 

@@ -18,7 +18,8 @@
 #define MAX_STR_LEN 255
 #define MAX_RECORD_STR_LEN 50
 #define BUF_SIZE 255
-
+#define ARG_MAX 2097152
+#define IP_STR_LEN 17
 #define IP_NEEDED 1
 #define USERNAME_NEEDED 2
 #define INPUT_USR 4
@@ -357,6 +358,47 @@ int read_until (int sd, char *buf, int bufsize, char *end)
     } while(chk_end);
     return bufsize;
 }
+
+int read_malloc_until(int sd, char **str, int maxsize, char *end)
+{
+    char buf[BUF_SIZE];
+    int len = 0;
+    int rc;
+    int csize = BUF_SIZE;
+    *str = malloc(BUF_SIZE * sizeof(char));
+    while(1)
+    {
+        rc = read_until(sd, buf, BUF_SIZE, end);
+        if (rc + len > maxsize)
+        {/** tried to recieve more then possible */
+            free(*str);
+            str = NULL;
+            return -1;
+        }
+        if (rc == BUF_SIZE)
+        {/** need to continue reading **/
+            if (rc + len > csize)
+            {/** need to realloc **/
+                csize = min(maxsize, csize << 1);
+                *str = realloc(*str, csize);
+            }
+            strncpy(*str + len, buf, BUF_SIZE);
+            len += rc;
+        }
+        else
+        {
+            if (rc + len > csize)
+            {/** need to realloc **/
+                csize = rc + len;
+                *str = realloc(*str, csize);
+            }
+            strncpy(*str + len, buf, rc);
+            len += rc;
+
+            break;
+        }
+    }
+}
 int skip_spaces()
 {
     int num = 0;
@@ -374,7 +416,7 @@ int skip_spaces()
         {
             if (buf[i] != ' ' && buf[i] != '\t')
             {
-                recv(clientFd, buf, i + 1, 0);
+                recv(clientFd, buf, i, 0);
                 return num + i;
             }
         }
@@ -505,16 +547,16 @@ void runCommand(char *user, char *passwd, char *cmd, char *tail,
                         return;
                     }
                     int uid = pwd -> pw_uid;
-                    char sysCmd[2 * MAX_RECORD_STR_LEN + strlen(tail) + 1];
+                    char sysCmd[2 * MAX_RECORD_STR_LEN + IP_STR_LEN + strlen(tail) + 10];//10 is magic amount off additional spaces and last symbol
                     sprintf(sysCmd, "%s", currentItem -> sysCommand);
                     char * flagPos = strstr(sysCmd, "%i");
                     if (flagPos)
                     {
                         char * tmp = strdup(flagPos + 2);
                         *flagPos = '\0';
-                        char strIp[12];
+                        char strIp[IP_STR_LEN];
                         getStringFromIp(strIp, ip);
-                        sprintf(sysCmd, "%s%s%s", sysCmd, strIp, tmp);
+                        sprintf(sysCmd, "%s %s %s", sysCmd, strIp, tmp);
                         free(tmp);
                     }
                     flagPos = strstr(sysCmd, "%u");
@@ -522,7 +564,7 @@ void runCommand(char *user, char *passwd, char *cmd, char *tail,
                     {
                         char * tmp = strdup(flagPos + 2);
                         *flagPos = '\0';
-                        sprintf(sysCmd, "%s%s%s", sysCmd, user, tmp);
+                        sprintf(sysCmd, "%s %s %s", sysCmd, user, tmp);
                         free(tmp);
                     }
                     strcat(sysCmd, tail);
@@ -595,7 +637,7 @@ int main(int argc, char * argv[])
     struct sockaddr_in servAddr;
     struct sockaddr_in clientAddr;
     socklen_t clientAddrSize = sizeof(clientAddr);
-    char buf[BUF_SIZE]
+    char buf[MAX_RECORD_STR_LEN];
     int bufLength = 0;
     int breakWhile = 0;
 
@@ -630,7 +672,7 @@ int main(int argc, char * argv[])
         if (clientFd == -1)
             fprintf(stream, "%s error accepting client! errno = %d\n%s",
                     gettime(), errno, strerror(errno)), fflush(stream);
-        //char strIp[12];
+        //char strIp[IP_STR_LEN];
         char correctIp[INET_ADDRSTRLEN];
         const char *checkIp = inet_ntop(clientAddr.sin_family, &clientAddr.sin_addr,
                                         correctIp, INET_ADDRSTRLEN);
@@ -651,12 +693,67 @@ int main(int argc, char * argv[])
         bufLength = 0;
 
         breakWhile = 0;
-
+        char user[MAX_RECORD_STR_LEN];
+        char pswd[MAX_RECORD_STR_LEN];
+        char cmd[MAX_RECORD_STR_LEN];
+        char *tail;
         do {
             //int recLen = recv(clientFd, buf + bufLength, BUF_SIZE - bufLength, 0);
             //if (recLen != BUF_SIZE - bufLength) breakWhile = 1;
+            int recLen = read_until (clientFd, buf, MAX_RECORD_STR_LEN, " ");
+            if (recLen < MAX_RECORD_STR_LEN)
+            {
+                buf[recLen] = '\0';
+            }
+            else
+            {
+                char str[] = "error: user now found!";
+                write(clientFd, str, strlen(str));
+                fprintf(stream, "%s error: %s.", gettime(), str);
+                break;
+            }
+            strcpy(user, buf);
+            skip_spaces();
+            recLen = read_until(clientFd, buf, MAX_RECORD_STR_LEN, " ");
+            if (recLen < MAX_RECORD_STR_LEN)
+            {
+                buf[recLen] = '\0';
+            }
+            else
+            {
+                char str[] = "error: incorrect password!";
+                write(clientFd, str, strlen(str));
+                fprintf(stream, "%s error: %s.", gettime(), str);
+                break;
+            }
+            strcpy(pswd, buf);
+            skip_spaces();
+            recLen = read_until(clientFd, buf, MAX_RECORD_STR_LEN, " ");
+            if (recLen < MAX_RECORD_STR_LEN)
+            {
+                buf[recLen] = '\0';
+            }
+            else
+            {
+                char str[] = "error: wrong command!";
+                write(clientFd, str, strlen(str));
+                fprintf(stream, "%s error: %s.", gettime(), str);
+                break;
+            }
+            strcpy(cmd, buf);
+            read_malloc_until(clientFd, &tail, ARG_MAX, "\n");
+            if (clientFd)
+                    {
+                        fprintf(stream, "%s Get Command '%s %s %s %s'\n", gettime(), user, pswd, cmd, tail);
+                        fflush(stream);
 
-            if (echo)
+                        if (isChange(filename)) readFile(filename);
+                        runCommand(user, pswd, cmd, tail, clientAddr.sin_addr.s_addr);
+                        fprintf(stream, "%s Disconnect: result: %s", gettime(), buf);
+                        fflush(stream);
+                        send(clientFd, buf, strlen(buf) + 1, 0);
+                    }
+/*          if (echo)
             {
                 char tmp[BUF_SIZE];
                 memcpy(tmp, buf + bufLength, recLen);
@@ -664,12 +761,7 @@ int main(int argc, char * argv[])
 
                 send(clientFd, tmp, recLen + 1, 0);
             }
-
-            if (recLen > 0)
-                bufLength += recLen;
-            else
-                breakWhile = 1;
-
+*//*
             if (bufLength >= BUF_SIZE)
             {    //buffer owerflow
                 fprintf(stream, "%s Disconnect: error: buffer owerflow\n", gettime());
@@ -678,8 +770,8 @@ int main(int argc, char * argv[])
                 send(clientFd, msg, strlen(msg) + 1, 0);
                 break;
             }
-
-            int i = 0;
+*/
+/*            int i = 0;
             for (; i < bufLength; i++)
                 if (buf[i] == 13 || buf[i] == 10 || buf[i] == '\n')
                 {    //all ok
@@ -698,6 +790,7 @@ int main(int argc, char * argv[])
                     breakWhile = 1;
                     break;
                 }
+*/
         } while (!breakWhile);
 
         if (clientFd)
